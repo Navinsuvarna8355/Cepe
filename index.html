@@ -2313,8 +2313,8 @@ tr.atm-row td.strike-cell { color:var(--accent); }
 
     <!-- Main chart canvas -->
     <div id="emaChartWrap" style="position:relative;padding:0 8px 8px;touch-action:none;user-select:none;-webkit-user-select:none;">
-      <canvas id="candleCanvas" style="display:block;width:100%;height:360px;touch-action:none;cursor:crosshair;"></canvas>
-      <canvas id="drawingCanvas" width="100%" height="360" style="position:absolute;top:0;left:8px;right:8px;height:360px;pointer-events:none;"></canvas>
+      <canvas id="candleCanvas" style="display:block;width:100%;height:340px;max-height:55vh;touch-action:none;cursor:crosshair;"></canvas>
+      <canvas id="drawingCanvas" width="100%" height="340" style="position:absolute;top:0;left:8px;right:8px;height:340px;max-height:55vh;pointer-events:none;"></canvas>
     </div>
 
     <!-- Drawing Tools Bar — TradingView style -->
@@ -5195,9 +5195,12 @@ async function loadEmaChart() {
     return ist.toISOString().slice(0, 10);
   }
   const now  = new Date();
-  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000); // aaj ka data ensure karne ke liye +1 din
-  const past = new Date(now.getTime() - effectiveDays * 24 * 60 * 60 * 1000);
-  const toStr   = toISTDateStr(tomorrow);   // +1 day taaki aaj ka data miss na ho
+  // For day/week tf, use today as toStr (Upstox rejects future dates for daily candles)
+  // For minute tf, use tomorrow to include today's intraday
+  const isDayWeekTf = (tf === 'day' || tf === 'week');
+  const toDate  = isDayWeekTf ? now : new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  const past    = new Date(now.getTime() - effectiveDays * 24 * 60 * 60 * 1000);
+  const toStr   = toISTDateStr(toDate);
   const fromStr = toISTDateStr(past);
 
   let candles = [];
@@ -5279,8 +5282,10 @@ async function loadEmaChart() {
 
   emaAllCandles = candles;
   emaViewOffset = 0;
-  _cachedSignals = null;  // Clear signal cache on new data load
+  _cachedSignals  = null;  // Clear signal cache on new data load
   _signalCacheKey = '';
+  _csvSigCache    = null;  // Clear CSV signal cache
+  _csvSigCacheKey = '';
   if (subLabel) subLabel.textContent = `${label} · ${tf} · ${candles.length} bars`;
   const btInfo = document.getElementById('btDataInfo');
   const btWarn = document.getElementById('btApiWarn');
@@ -5731,9 +5736,17 @@ function buildIndicatorDatasets(candles, viewStart, viewEnd) {
     
     // ── CSV Strategy: calculate fresh signals using live OI ──
     if (strat.id === 'strat_csv') {
+      // Skip heavy computation if not visible
+      if (!strat.visible) return;
       const liveIVnow  = liveOI ? (liveOI.atmCeIv || 20) : 20;
       const livePCRnow = liveOI ? liveOI.pcr : 1.0;
-      const csvSigs = calcCsvStrategySignals(candles, emaCloseFull, emaOpenFull, liveIVnow, livePCRnow, liveOI);
+      // Cache CSV signals to avoid recompute on every scroll/render
+      const _csvCKey = candles.length + '_' + liveIVnow.toFixed(0) + '_' + livePCRnow.toFixed(2);
+      if (!_csvSigCache || _csvSigCacheKey !== _csvCKey) {
+        _csvSigCache    = calcCsvStrategySignals(candles, emaCloseFull, emaOpenFull, liveIVnow, livePCRnow, liveOI);
+        _csvSigCacheKey = _csvCKey;
+      }
+      const csvSigs = _csvSigCache;
       
       // viewHighs/viewLows for CSV signal positioning
       const _csvHighs = candles.slice(viewStart, viewEnd).map(c => c[2]);
@@ -7633,7 +7646,7 @@ function renderEmaChart() {
     data: { labels, datasets },
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
-      layout: { padding: { top: 20 } },
+      layout: { padding: { top: 4, bottom: 0, left: 0, right: 8 } },
       interaction: { mode:'index', intersect:false },
       plugins: {
         datalabels: { display: false },
@@ -7702,28 +7715,19 @@ function renderEmaChart() {
           })(),
         },
         zoom: {
-          pan:  { 
-            enabled: true, mode: 'x',
-            onPan({ chart }) {
-              // Sync zoom-pan with our emaViewOffset
-              const total = emaAllCandles.length;
-              const visMin = chart.scales.x.min;
-              const visMax = chart.scales.x.max;
-              const visLen = visMax - visMin;
-              // Convert pan position to offset
-              const newOffset = Math.max(0, total - Math.round(visMax) - 1);
-              emaViewOffset = Math.min(Math.max(0, newOffset), total - EMA_VIEW_BARS);
-            }
-          },
+          pan:  { enabled: false },
           zoom: { 
-            wheel:{ enabled:true, speed:0.05 },
-            pinch:{ enabled:true },
-            mode:'x',
+            wheel: { enabled: true, speed: 0.08 },
+            pinch: { enabled: false },  // handled by our touch code
+            mode: 'x',
             onZoom({ chart }) {
-              // Update EMA_VIEW_BARS based on zoom level
               const visLen = Math.round(chart.scales.x.max - chart.scales.x.min);
-              if (visLen > 10 && visLen < 500) {
-                EMA_VIEW_BARS = visLen;
+              if (visLen > 5 && visLen < 600) {
+                EMA_VIEW_BARS = Math.round(visLen);
+                const maxOff = Math.max(0, emaAllCandles.length - EMA_VIEW_BARS);
+                emaViewOffset = Math.min(emaViewOffset, maxOff);
+                try { chart.resetZoom(); } catch(e) {}
+                renderEmaChart();
               }
             }
           },
@@ -7731,9 +7735,27 @@ function renderEmaChart() {
         crosshair: {},
       },
       scales: {
-        x:  { display:true, ticks:{ color:'var(--muted)', font:{family:'Space Mono',size:9}, maxTicksLimit:8 }, grid:{ color:'rgba(255,255,255,.04)' } },
+        x: {
+          display: true,
+          ticks: {
+            color: '#4a6a8a', font: { family:'Space Mono', size:8 },
+            maxTicksLimit: 6, maxRotation: 0, minRotation: 0,
+            autoSkip: true, padding: 2,
+          },
+          grid: { color:'rgba(255,255,255,.03)', drawBorder: false },
+          offset: false,
+          bounds: 'data',
+          afterFit: (axis) => { axis.paddingLeft = 0; axis.paddingRight = 0; },
+        },
         x2: { display:false, type:'linear', min:0, max:view.length-1 },
-        y:  { display:true, position:'right', ticks:{ color:'var(--muted)', font:{family:'Space Mono',size:9} }, grid:{ color:'rgba(255,255,255,.04)' } },
+        y: {
+          display: true, position: 'right',
+          ticks: {
+            color: '#4a6a8a', font: { family:'Space Mono', size:8 },
+            maxTicksLimit: 8,
+          },
+          grid: { color:'rgba(255,255,255,.03)' },
+        },
       },
       onHover: (e, els, chart) => {
         const x = e.native?.offsetX, y = e.native?.offsetY;
@@ -7823,6 +7845,9 @@ function getBarIndexFromPixel(chart, px) {
   return Math.round(chart.scales.x.getValueForPixel(px));
 }
 
+// Mouse drag state for chart pan
+let _mousePan = { active:false, startX:0, startOffset:0 };
+
 function initDrawingCanvas() {
   const canvas = document.getElementById('drawingCanvas');
   if (!canvas) return;
@@ -7841,6 +7866,24 @@ function initDrawingCanvas() {
   canvas.addEventListener('mouseup',   onDrawEnd);
   canvas.addEventListener('mouseleave',onDrawEnd);
   
+  // ── Mouse wheel zoom on chart canvas ──
+  const cc2 = document.getElementById('candleCanvas');
+  if (cc2) {
+    cc2.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      if (!emaAllCandles.length) return;
+      const delta = e.deltaY > 0 ? 1.15 : 0.87; // scroll down = zoom out
+      const newBars = Math.round(EMA_VIEW_BARS * delta);
+      EMA_VIEW_BARS = Math.max(20, Math.min(400, newBars));
+      const maxOff = Math.max(0, emaAllCandles.length - EMA_VIEW_BARS);
+      emaViewOffset = Math.min(emaViewOffset, maxOff);
+      if (!_touchState._rafPending) {
+        _touchState._rafPending = true;
+        requestAnimationFrame(() => { _touchState._rafPending=false; renderEmaChart(); });
+      }
+    }, { passive: false });
+  }
+  
   // Touch support
   canvas.addEventListener('touchstart', e => { e.preventDefault(); const t=e.touches[0]; onDrawStart({offsetX:t.clientX-canvas.getBoundingClientRect().left, offsetY:t.clientY-canvas.getBoundingClientRect().top}); }, {passive:false});
   canvas.addEventListener('touchmove',  e => { e.preventDefault(); const t=e.touches[0]; onDrawMove({offsetX:t.clientX-canvas.getBoundingClientRect().left, offsetY:t.clientY-canvas.getBoundingClientRect().top}); }, {passive:false});
@@ -7852,6 +7895,14 @@ function onDrawStart(e) {
   const px = e.offsetX, py = e.offsetY;
   const price = getPriceFromPixel(candleChart, py);
   const barIdx = getBarIndexFromPixel(candleChart, px);
+  
+  // Cross tool = pan chart by dragging
+  if (activeDrawTool === 'cross') {
+    _mousePan.active      = true;
+    _mousePan.startX      = px;
+    _mousePan.startOffset = emaViewOffset;
+    return;
+  }
   
   if (activeDrawTool === 'eraser') {
     // Find and remove nearest drawing
@@ -7903,6 +7954,24 @@ function onDrawStart(e) {
 function onDrawMove(e) {
   if (!candleChart) return;
   
+  // Cross tool pan
+  if (activeDrawTool === 'cross' && _mousePan.active) {
+    const dx = e.offsetX - _mousePan.startX;
+    const canvas = document.getElementById('candleCanvas');
+    if (canvas) {
+      const pxPerBar = (canvas.offsetWidth * 0.85) / EMA_VIEW_BARS;
+      const barsDelta = dx / pxPerBar;
+      const maxOff = Math.max(0, emaAllCandles.length - EMA_VIEW_BARS);
+      emaViewOffset = Math.max(0, Math.min(maxOff, _mousePan.startOffset - barsDelta));
+      if (!_touchState._rafPending) {
+        _touchState._rafPending = true;
+        requestAnimationFrame(() => { _touchState._rafPending=false; renderEmaChart(); });
+      }
+    }
+    redrawDrawings(e.offsetX, e.offsetY);
+    return;
+  }
+  
   // Always redraw to show live crosshair (even without drawing)
   redrawDrawings(e.offsetX, e.offsetY);
   
@@ -7920,6 +7989,7 @@ function onDrawMove(e) {
 }
 
 function onDrawEnd(e) {
+  _mousePan.active = false;
   if (isDrawing && drawingInProgress) {
     if (drawingInProgress.points.length >= 2 && 
         (drawingInProgress.px1 !== drawingInProgress.px2 || drawingInProgress.py1 !== drawingInProgress.py2)) {
